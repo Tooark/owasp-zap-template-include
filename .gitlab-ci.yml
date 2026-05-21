@@ -1,0 +1,342 @@
+spec:
+  inputs:
+    stage:
+      description: "Stage to run OWASP ZAP scan"
+      type: string
+      default: dast
+    environment:
+      description: "Environment for Scan and Quality Gate"
+      type: string
+      default: dast
+    dependencie_jobs:
+      description: "Other job dependencies (YAML list format, e.g., [\"build\",\"test\"]). These jobs will be added to needs: for the ZAP jobs."
+      type: array
+      default: [ "" ]
+    # ZAP-specific variables - Required
+    zap_target_url:
+      description: "URL of the running application (e.g., dev/hml)"
+      type: string
+      default: ""
+    # ZAP-specific variables - Optional
+    zap_auth_token:
+      description: "Bearer token for authenticated APIs — store as a masked CI/CD variable"
+      type: string
+      default: ""
+    zap_api_spec_url:
+      description: "URL to the OpenAPI JSON/YAML served by the API"
+      type: string
+      default: ""
+    zap_api_format:
+      description: "API format: openapi (default) | graphql | soap"
+      type: string
+      default: "openapi"
+    zap_min_level:
+      description: "Minimum alert level: INFO, IGNORE or FAIL"
+      type: string
+      default: "FAIL"
+    zap_spider_mins:
+      description: "Minutes to run spidering during full-scan"
+      type: string
+      default: "3"
+    zap_rules_file:
+      description: "Path to a custom rules .conf file"
+      type: string
+      default: ""
+    zap_api_enabled:
+      description: "Enable the API scan job (true/false)"
+      type: string
+      default: "false"
+    zap_allow_prod:
+      description: "Allow scans on production branches/environments when true"
+      type: string
+      default: "true"
+    zap_audit_only:
+      description: "If true, run ZAP in audit-only mode (adds -I); if false, ZAP can return a non-zero exit code to fail the pipeline"
+      type: string
+      default: "true"
+    zap_extra_args:
+      description: "Extra arguments passed to the ZAP scripts (e.g., -z \"-config api.key='' -context /zap/wrk/contexts/hml.context -user admin\")"
+      type: string
+      default: ""
+    zap_contexts_dir:
+      description: "Local repo directory containing .context files for ZAP (default: contexts/)"
+      type: string
+      default: "contexts"
+    zap_scripts_dir:
+      description: "Local repo directory containing ZAP scripts (default: scripts/)"
+      type: string
+      default: "scripts"
+    zap_runner_tags:
+      description: "Runner tags for ZAP jobs (YAML list format, e.g., [\"linux\",\"docker\"])"
+      type: string
+      default: ""
+    zap_full_scan:
+      type: string
+      description: "Enable ZAP full scan"
+      default: "true"
+    send_to_defectdojo:
+      description: "Enable uploading reports to DefectDojo (true/false)"
+      type: string
+      default: "false"
+    defectdojo_url:
+      description: "DefectDojo instance URL"
+      type: string
+      default: ""
+    defectdojo_api_key:
+      description: "DefectDojo API key"
+      type: string
+      default: ""
+    defectdojo_engagement_id:
+      description: "DefectDojo engagement ID to associate scans with"
+      type: string
+      default: ""
+---
+
+default:
+  retry:
+    max: 2
+    when:
+    - runner_system_failure
+    - stuck_or_timeout_failure
+    - api_failure
+    - job_execution_timeout
+    - scheduler_failure
+
+stages:
+- $[[ inputs.stage ]]
+
+.zap_base:
+  image: ghcr.io/zaproxy/zaproxy:stable
+  environment: $[[ inputs.environment ]]
+  needs:
+  - $[[ inputs.dependencie_jobs ]]
+  stage: $[[ inputs.stage ]]
+  variables:
+    ZAP_TARGET_URL: $[[inputs.zap_target_url]]
+    ZAP_REPORT_DIR: "zap-reports"
+    ZAP_MIN_LEVEL: $[[inputs.zap_min_level]]
+    ZAP_AUTH_TOKEN: $[[inputs.zap_auth_token]]
+    ZAP_RULES_FILE: $[[inputs.zap_rules_file]]
+    ZAP_API_ENABLED: $[[inputs.zap_api_enabled]]
+    ZAP_API_SPEC_URL: $[[inputs.zap_api_spec_url]]
+    ZAP_API_FORMAT: $[[inputs.zap_api_format]]
+    ZAP_FULL_SCAN: $[[inputs.zap_full_scan]]
+    ZAP_ALLOW_PROD: $[[inputs.zap_allow_prod]]
+    ZAP_AUDIT_ONLY: $[[inputs.zap_audit_only]]
+    ZAP_EXTRA_ARGS: $[[inputs.zap_extra_args]]
+    ZAP_CONTEXTS_DIR: $[[inputs.zap_contexts_dir]]
+    ZAP_SCRIPTS_DIR: $[[inputs.zap_scripts_dir]]
+    SEND_TO_DEFECTDOJO: $[[inputs.send_to_defectdojo]]
+    DEFECTDOJO_URL: $[[inputs.defectdojo_url]]
+    DEFECTDOJO_API_KEY: $[[inputs.defectdojo_api_key]]
+    DEFECTDOJO_ENGAGEMENT_ID: $[[inputs.defectdojo_engagement_id]]
+  before_script:
+  - mkdir -p /zap/wrk/"$ZAP_REPORT_DIR"
+  - mkdir -p "$ZAP_REPORT_DIR"
+  - |
+    # Build auth argument if token provided.
+    ZAP_AUTH_ARGS=""
+    if [ -n "$ZAP_AUTH_TOKEN" ]; then
+      ZAP_AUTH_ARGS="\
+        -config replacer.full_list(0).description=BearerAuth \
+        -config replacer.full_list(0).enabled=true \
+        -config replacer.full_list(0).matchtype=REQ_HEADER \
+        -config replacer.full_list(0).matchstr=Authorization \
+        -config replacer.full_list(0).replacement=Bearer\ ${ZAP_AUTH_TOKEN}"
+    fi
+
+    export ZAP_AUTH_ARGS
+
+    # Copy local contexts and scripts into ZAP working dir so -context and scripts work
+    if [ -n "$ZAP_CONTEXTS_DIR" ] && [ -d "$ZAP_CONTEXTS_DIR" ]; then
+      cp -r "$ZAP_CONTEXTS_DIR" /zap/wrk/ || true
+    fi
+
+    if [ -n "$ZAP_SCRIPTS_DIR" ] && [ -d "$ZAP_SCRIPTS_DIR" ]; then
+      cp -r "$ZAP_SCRIPTS_DIR" /zap/wrk/ || true
+    fi
+  after_script:
+  - |
+    if [ -d /zap/wrk/"$ZAP_REPORT_DIR" ]; then
+      mkdir -p "$ZAP_REPORT_DIR"
+      cp -r /zap/wrk/"$ZAP_REPORT_DIR"/. "$ZAP_REPORT_DIR"/ || true
+    fi
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+    - "$ZAP_REPORT_DIR/"
+  tags:
+  - $[[ inputs.zap_runner_tags ]]
+
+# BASELINE - passive scan (fast)
+zap_baseline:
+  extends: .zap_base
+  stage: $[[ inputs.stage ]]
+  script:
+  - |
+    [ -z "$ZAP_TARGET_URL" ] && echo "Erro: ZAP_TARGET_URL nao definida" && exit 1
+
+    RULES_ARG=""
+    [ -n "$ZAP_RULES_FILE" ] && RULES_ARG="-c $ZAP_RULES_FILE"
+
+    AUDIT_ARG=""
+    if [ "${ZAP_AUDIT_ONLY:-true}" = "true" ]; then
+      AUDIT_ARG="-I"
+    fi
+
+    zap-baseline.py \
+      -t "$ZAP_TARGET_URL" \
+      -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-baseline-report.html" \
+      -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-baseline-report.json" \
+      -l "$ZAP_MIN_LEVEL" \
+      $AUDIT_ARG \
+      $RULES_ARG \
+      -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS"
+
+    echo "Relatorio salvo em: $ZAP_REPORT_DIR/"
+  rules:
+  - if: '$[[inputs.zap_full_scan]] == "true"'
+    when: never
+  - when: always
+
+# API SCAN - active API scan (spec-driven)
+zap_api_scan:
+  extends: .zap_base
+  script:
+  - |
+    [ "${ZAP_API_ENABLED}" != "true" ] && echo "ZAP API scan desabilitado (ZAP_API_ENABLED != true)" && exit 0
+
+    # Safety: detect production branch/environment and require explicit allowance
+    IS_PROD=false
+    if echo "${CI_COMMIT_BRANCH:-}" | grep -qiE '(^prod$|^production$|^main$|^master)'; then
+      IS_PROD=true
+    fi
+    if [ -n "${CI_ENVIRONMENT_NAME:-}" ]; then
+      if echo "${CI_ENVIRONMENT_NAME}" | grep -qiE 'prod|production'; then
+        IS_PROD=true
+      fi
+    fi
+    if [ "$IS_PROD" = "true" ] && [ "${ZAP_ALLOW_PROD}" != "true" ]; then
+      echo "BLOQUEADO: ZAP API scan em ambiente/branch de producao requer ZAP_ALLOW_PROD=true (safety)" && exit 1
+    fi
+    [ -z "$ZAP_TARGET_URL" ]   && echo "Erro: ZAP_TARGET_URL nao definida"   && exit 1
+    [ -z "$ZAP_API_SPEC_URL" ] && echo "Erro: ZAP_API_SPEC_URL nao definida" && exit 1
+
+    RULES_ARG=""
+    [ -n "$ZAP_RULES_FILE" ] && RULES_ARG="-c $ZAP_RULES_FILE"
+
+    AUDIT_ARG=""
+    if [ "${ZAP_AUDIT_ONLY:-true}" = "true" ]; then
+      AUDIT_ARG="-I"
+    fi
+
+    zap-api-scan.py \
+      -t "$ZAP_TARGET_URL" \
+      -f "$ZAP_API_FORMAT" \
+      -S "$ZAP_API_SPEC_URL" \
+      -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-api-report.html" \
+      -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-api-report.json" \
+      -l "$ZAP_MIN_LEVEL" \
+        $AUDIT_ARG \
+        $RULES_ARG \
+        -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS"
+
+    echo "Relatorio salvo em: $ZAP_REPORT_DIR/"
+  rules:
+  - if: '$[[inputs.zap_full_scan]] == "true"'
+    when: never
+  - if: '$[[inputs.zap_api_enabled]] == "true"'
+    when: always
+  - if: '$[[inputs.zap_api_enabled]] == "true"'
+    when: manual
+  - when: never
+
+# FULL SCAN - active full scan (manual, heavy)
+zap_full_scan:
+  extends: .zap_base
+  stage: $[[ inputs.stage ]]
+  variables:
+    ZAP_SPIDER_MINS: "3"
+  resource_group: dast-full-scan
+  before_script:
+  - !reference [ .zap_base, before_script ]
+  - |
+    # Guardrail: prevent accidental full-scan against production targets unless explicitly allowed
+    if echo "$ZAP_TARGET_URL" | grep -qiE '(prod|production)'; then
+      if [ "${ZAP_ALLOW_PROD:-false}" != "true" ]; then
+        echo "BLOCKED: full-scan is not allowed against production-like URLs without ZAP_ALLOW_PROD=true."
+        echo "Received URL: $ZAP_TARGET_URL"
+        exit 1
+      fi
+    fi
+  script:
+  - |
+    [ -z "$ZAP_TARGET_URL" ] && echo "Erro: ZAP_TARGET_URL nao definida" && exit 1
+
+    RULES_ARG=""
+    [ -n "$ZAP_RULES_FILE" ] && RULES_ARG="-c $ZAP_RULES_FILE"
+
+    AUDIT_ARG=""
+    if [ "${ZAP_AUDIT_ONLY:-true}" = "true" ]; then
+      AUDIT_ARG="-I"
+    fi
+
+    zap-full-scan.py \
+      -t "$ZAP_TARGET_URL" \
+      -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-full-report.html" \
+      -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-full-report.json" \
+      -l "$ZAP_MIN_LEVEL" \
+      -m "$ZAP_SPIDER_MINS" \
+      $AUDIT_ARG \
+      $RULES_ARG \
+      -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS"
+
+    echo "Relatorio salvo em: $ZAP_REPORT_DIR/"
+  rules:
+  - if: '$[[inputs.zap_full_scan]] == "true"'
+    when: always
+  - when: never
+
+# optional DefectDojo upload
+zap_defectdojo:
+  image: curlimages/curl:latest
+  stage: $[[ inputs.stage ]]
+  variables:
+    ZAP_REPORT_DIR: "zap-reports"
+  needs:
+  - job: zap_baseline
+    artifacts: true
+    optional: true
+  - job: zap_api_scan
+    artifacts: true
+    optional: true
+  - job: zap_full_scan
+    artifacts: true
+    optional: true
+  script:
+  - |
+    if [ "$SEND_TO_DEFECTDOJO" != "true" ]; then
+      echo "SEND_TO_DEFECTDOJO != true — pulando upload para DefectDojo" && exit 0
+    fi
+    if [ -z "$DEFECTDOJO_URL" ] || [ -z "$DEFECTDOJO_API_KEY" ]; then
+      echo "DEFECTDOJO_URL e/ou DEFECTDOJO_API_KEY nao definidos" && exit 1
+    fi
+
+    for f in $ZAP_REPORT_DIR/*-report.json; do
+      [ -f "$f" ] || continue
+      echo "Enviando $f para DefectDojo..."
+      curl -k -s -X POST "$DEFECTDOJO_URL/api/v2/import-scan/" \
+        -H "Authorization: Token $DEFECTDOJO_API_KEY" \
+        -F "file=@$f" \
+        -F "scan_type=ZAP" \
+        -F "minimum_severity=$ZAP_MIN_LEVEL" \
+        -F "engagement=$DEFECTDOJO_ENGAGEMENT_ID"
+    done
+  allow_failure: true
+  rules:
+  - if: '$[[inputs.send_to_defectdojo]] == "true"'
+    when: manual
+  - when: never
+  tags:
+  - $[[ inputs.zap_runner_tags ]]
