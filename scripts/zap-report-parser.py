@@ -1,0 +1,1 @@
+#Ideia - fazer um parser que manda os dados da analise para um url com payload json, para ser processado por um sistema de monitoramento de vulnerabilidades ou entrar em uma automação

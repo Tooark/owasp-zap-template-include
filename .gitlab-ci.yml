@@ -90,6 +90,54 @@ spec:
       description: "DefectDojo engagement ID to associate scans with"
       type: string
       default: ""
+    # Authentication variables
+
+    # ── OIDC: client_credentials e ropc ──────────────────────
+    oidc_token_endpoint:
+      default: ""
+    oidc_client_id:
+      default: ""
+    oidc_scope:
+      default: ""
+    oidc_audience:
+      default: ""
+    # Para ROPC: nomes das CI vars que carregam user/senha do usuário de serviço
+    ropc_username_var:
+      default: "ZAP_ROPC_USERNAME"
+    ropc_password_var:
+      default: "ZAP_ROPC_PASSWORD"
+
+    # ── JWT local (auth da própria API) ──────────────────────
+    jwt_login_url:
+      default: ""
+    jwt_login_payload_template:
+      default: '{"username":"$JWT_USER","password":"$JWT_PASS"}'
+    jwt_token_jq_path:
+      default: ".access_token"
+
+    # ── API Key ──────────────────────────────────────────────
+    api_key_header_name:
+      default: "X-API-Key"
+
+    # ── Cookie/Session ───────────────────────────────────────
+    session_login_url:
+      default: ""
+    session_login_form_template:
+      default: "username=$SESSION_USER&password=$SESSION_PASS"
+    session_cookie_name:
+      default: "JSESSIONID"
+
+    # ── mTLS ─────────────────────────────────────────────────
+    mtls_p12_var:
+      default: "ZAP_MTLS_P12_B64"
+    mtls_p12_password_var:
+      default: "ZAP_MTLS_P12_PASSWORD"
+
+    # ── Imagens ──────────────────────────────────────────────
+    auth_handler_image:
+      default: "registry.example.com/security/zap-auth-handler:1.0.0"
+    zap_image:
+      default: "ghcr.io/zaproxy/zaproxy:stable"
 ---
 
 default:
@@ -169,6 +217,42 @@ stages:
   tags:
   - $[[ inputs.zap_runner_tags ]]
 
+zap:auth:
+  stage: $[[ inputs.scan_stage ]]
+  image: $[[ inputs.auth_handler_image ]]
+  variables:
+    AUTH_TYPE: "$[[ inputs.auth_type ]]"
+    TARGET_URL: "$[[ inputs.target_url ]]"
+
+    OIDC_TOKEN_ENDPOINT: "$[[ inputs.oidc_token_endpoint ]]"
+    OIDC_CLIENT_ID: "$[[ inputs.oidc_client_id ]]"
+    OIDC_SCOPE: "$[[ inputs.oidc_scope ]]"
+    OIDC_AUDIENCE: "$[[ inputs.oidc_audience ]]"
+    ROPC_USERNAME_VAR: "$[[ inputs.ropc_username_var ]]"
+    ROPC_PASSWORD_VAR: "$[[ inputs.ropc_password_var ]]"
+
+    JWT_LOGIN_URL: "$[[ inputs.jwt_login_url ]]"
+    JWT_LOGIN_PAYLOAD_TEMPLATE: "$[[ inputs.jwt_login_payload_template ]]"
+    JWT_TOKEN_JQ_PATH: "$[[ inputs.jwt_token_jq_path ]]"
+
+    API_KEY_HEADER_NAME: "$[[ inputs.api_key_header_name ]]"
+
+    SESSION_LOGIN_URL: "$[[ inputs.session_login_url ]]"
+    SESSION_LOGIN_FORM_TEMPLATE: "$[[ inputs.session_login_form_template ]]"
+    SESSION_COOKIE_NAME: "$[[ inputs.session_cookie_name ]]"
+
+    MTLS_P12_VAR: "$[[ inputs.mtls_p12_var ]]"
+    MTLS_P12_PASSWORD_VAR: "$[[ inputs.mtls_p12_password_var ]]"
+  script:
+    - /opt/zap-auth/dispatcher.sh
+  artifacts:
+    reports:
+      dotenv: artifacts/auth.env
+    paths:
+      - artifacts/
+    expire_in: 30 minutes
+    when: always
+    
 # BASELINE - passive scan (fast)
 zap_baseline:
   extends: .zap_base
