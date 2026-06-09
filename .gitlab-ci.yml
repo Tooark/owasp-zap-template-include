@@ -201,14 +201,16 @@ nuclei:
     elif [ ! -f nuclei-report.jsonl ]; then
       echo "nuclei-report.jsonl nao encontrado — pulando upload"
     else
-      echo "Enviando nuclei-report.jsonl para DefectDojo..."
-      curl -k -s -f -X POST "$DEFECTDOJO_URL/api/v2/import-scan/" \
+      echo "Enviando nuclei-report.jsonl para DefectDojo (reimport)..."
+      curl -k -s -f -X POST "$DEFECTDOJO_URL/api/v2/reimport-scan/" \
         -H "Authorization: Token $DEFECTDOJO_API_KEY" \
         -F "scan_type=Nuclei Scan" \
         -F "engagement=$DEFECTDOJO_ENGAGEMENT_ID" \
         -F "file=@nuclei-report.jsonl" \
         -F "active=true" \
-        -F "verified=true"
+        -F "verified=true" \
+        -F "do_not_reactivate=false" \
+        -F "auto_create_context=true"
       echo "Upload concluido."
     fi
   artifacts:
@@ -217,11 +219,9 @@ nuclei:
     paths:
     - nuclei-report.jsonl
   allow_failure: true
-  
+
 # BASELINE - passive scan (fast)
 zap_baseline:
-  extends: .zap_base
-  stage: $[[ inputs.stage ]]
   script:
   - |
     [ -z "$TARGET_URL" ] && echo "Erro: TARGET_URL nao definida" && exit 1
@@ -304,7 +304,6 @@ zap_api_scan:
 # FULL SCAN - active full scan (manual, heavy)
 zap_full_scan:
   extends: .zap_base
-  stage: $[[ inputs.stage ]]
   variables:
     ZAP_SPIDER_MINS: "3"
   resource_group: dast-full-scan
@@ -374,13 +373,15 @@ zap_defectdojo:
 
     for f in $ZAP_REPORT_DIR/*-report.json; do
       [ -f "$f" ] || continue
-      echo "Enviando $f para DefectDojo..."
-      curl -k -s -X POST "$DEFECTDOJO_URL/api/v2/import-scan/" \
+      echo "Enviando $f para DefectDojo (reimport)..."
+      curl -k -s -X POST "$DEFECTDOJO_URL/api/v2/reimport-scan/" \
         -H "Authorization: Token $DEFECTDOJO_API_KEY" \
         -F "file=@$f" \
         -F "scan_type=ZAP" \
         -F "minimum_severity=$ZAP_MIN_LEVEL" \
-        -F "engagement=$DEFECTDOJO_ENGAGEMENT_ID"
+        -F "engagement=$DEFECTDOJO_ENGAGEMENT_ID" \
+        -F "do_not_reactivate=false" \
+        -F "auto_create_context=true"
     done
   allow_failure: true
   rules:
