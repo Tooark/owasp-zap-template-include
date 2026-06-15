@@ -1,0 +1,361 @@
+spec:
+  inputs:
+    stage:
+      description: "Stage to run OWASP ZAP scan"
+      type: string
+      default: dast
+    environment:
+      description: "Environment for Scan and Quality Gate"
+      type: string
+      default: dast
+    dependencie_jobs:
+      description: "Other job dependencies (YAML list format, e.g., [\"build\",\"test\"]). These jobs will be added to needs: for the ZAP jobs."
+      type: array
+      default: [ "" ]
+    # ZAP-specific variables - Required
+    zap_target_url:
+      description: "URL of the running application (e.g., dev/hml)"
+      type: string
+      default: ""
+    # ZAP-specific variables - Optional
+    zap_auth_token:
+      description: "Bearer token for authenticated APIs — store as a masked CI/CD variable"
+      type: string
+      default: ""
+    zap_api_spec_url:
+      description: "URL to the OpenAPI JSON/YAML served by the API"
+      type: string
+      default: ""
+    zap_api_format:
+      description: "API format: openapi (default) | graphql | soap"
+      type: string
+      default: "openapi"
+    zap_min_level:
+      description: "Minimum alert level: INFO, IGNORE or FAIL"
+      type: string
+      default: "FAIL"
+    zap_spider_mins:
+      description: "Minutes to run spidering during full-scan"
+      type: string
+      default: "3"
+    zap_rules_file:
+      description: "Path to a custom rules .conf file"
+      type: string
+      default: ""
+    zap_api_enabled:
+      description: "Enable the API scan job (true/false)"
+      type: string
+      default: "false"
+    zap_allow_prod:
+      description: "Allow scans on production branches/environments when true"
+      type: string
+      default: "true"
+    zap_audit_only:
+      description: "If true, run ZAP in audit-only mode (adds -I); if false, ZAP can return a non-zero exit code to fail the pipeline"
+      type: string
+      default: "true"
+    zap_extra_args:
+      description: "Extra arguments passed to the ZAP scripts (e.g., -z \"-config api.key='' -context /zap/wrk/contexts/hml.context -user admin\")"
+      type: string
+      default: ""
+    zap_contexts_dir:
+      description: "Local repo directory containing .context files for ZAP (default: contexts/)"
+      type: string
+      default: "contexts"
+    zap_scripts_dir:
+      description: "Local repo directory containing ZAP scripts (default: scripts/)"
+      type: string
+      default: "scripts"
+    zap_full_scan:
+      type: string
+      description: "Enable ZAP full scan"
+      default: "true"
+    send_to_defectdojo:
+      description: "Enable uploading reports to DefectDojo (true/false)"
+      type: string
+      default: "false"
+    defectdojo_url:
+      description: "DefectDojo instance URL"
+      type: string
+      default: ""
+    defectdojo_api_key:
+      description: "DefectDojo API key (masked CI/CD variable)"
+      type: string
+      default: ""
+    defectdojo_product_name:
+      description: "DefectDojo product name (auto_create_context)"
+      type: string
+      default: ""
+    defectdojo_engagement_name:
+      description: "DefectDojo engagement name (auto_create_context) - defaults to CI/CD"
+      type: string
+      default: "CI/CD"
+    defectdojo_engagement_id:
+      description: "[DEPRECATED] DefectDojo engagement ID (kept for backwards compatibility)"
+      type: string
+      default: ""
+    defectdojo_nuclei_product_type_name:
+      description: "DefectDojo product type name for Nuclei uploads (optional override)"
+      type: string
+      default: "Nuclei Scan"
+    defectdojo_zap_product_type_name:
+      description: "DefectDojo product type name for ZAP uploads (optional override)"
+      type: string
+      default: "ZAP Scan"
+---
+
+default:
+  retry:
+    max: 2
+    when:
+    - runner_system_failure
+    - stuck_or_timeout_failure
+    - api_failure
+    - job_execution_timeout
+    - scheduler_failure
+
+stages:
+- $[[ inputs.stage ]]
+
+# Shared library for DefectDojo reimport API calls, used by both Nuclei and ZAP jobs
+.defectdojo_lib:
+  script:
+  - |
+    dd_reimport() {
+      file="$1"; scan_type="$2"; test_title="$3"; job_product_type="$4"
+      [ -f "$file" ] || { echo "skip (no file): $file"; return 0; }
+      if [ "$DD_ACTIVATED" != "true" ] || [ -z "$DD_URL" ] || [ -z "$DD_TOKEN" ]; then
+        echo "DefectDojo desativado ou variaveis ausentes - pulando upload: $file"
+        return 0
+      fi
+      if [ -z "$DD_PRODUCT" ]; then
+        echo "ERROR: DD_PRODUCT eh obrigatorio quando DefectDojo esta ativado"
+        return 1
+      fi
+      # Backward compatible fallback: job-specific value -> global value.
+      [ -n "$job_product_type" ] || job_product_type="$DD_PRODUCT_TYPE"
+      
+      # If we are creating context by product/engagement names, check if product exists.
+      PRODUCT_EXISTS=true
+      if [ -n "$DD_PRODUCT" ]; then
+        PRODUCT_QUERY=$(jq -rn --arg value "$DD_PRODUCT" '$value|@uri')
+        PRODUCT_LOOKUP_URL="$DD_URL/api/v2/products/?name=$PRODUCT_QUERY"
+        PRODUCT_RESPONSE=$(curl -k -sS -H "Authorization: Token $DD_TOKEN" "$PRODUCT_LOOKUP_URL") || {
+          echo "ERROR: product lookup failed for '$DD_PRODUCT'"
+          return 1
+        }
+        PRODUCT_EXISTS=$(printf '%s' "$PRODUCT_RESPONSE" | jq -r --arg name "$DD_PRODUCT" 'any(.results[]?; .name == $name)')
+      fi
+      
+      echo "Reimport -> DefectDojo: $file ($scan_type / $test_title)"
+      set -- -k -sS -X POST "$DD_URL/api/v2/reimport-scan/" \
+        -H "Authorization: Token $DD_TOKEN" \
+        -F "file=@$file" \
+        -F "scan_type=$scan_type" \
+        -F "test_title=$test_title" \
+        -F "close_old_findings=true" \
+        -F "active=true" \
+        -F "verified=false" \
+        -F "minimum_severity=Info" \
+        -F "auto_create_context=true" \
+        -F "product_name=$DD_PRODUCT" \
+        -F "engagement_name=${DD_ENGAGEMENT_NAME:-CI/CD}"
+      
+      if [ "$PRODUCT_EXISTS" != "true" ]; then
+        if [ -z "$job_product_type" ]; then
+          echo "ERROR: product_type_name eh obrigatorio para criar produto '$DD_PRODUCT'"
+          return 1
+        fi
+        set -- "$@" -F "product_type_name=$job_product_type"
+      fi
+      
+      code=$(curl "$@" -o /tmp/dd_resp.json -w "%{http_code}") || {
+        echo "curl failed: $file"
+        return 1
+      }
+      echo "HTTP $code"; head -c 500 /tmp/dd_resp.json 2>/dev/null; echo
+      case "$code" in
+        2*) ;;
+        *) echo "ERROR: DefectDojo reimport failed (HTTP $code)"; return 1 ;;
+      esac
+    }
+
+# Nuclei DAST: scan + envio ao DefectDojo no mesmo job
+nuclei:
+  stage: $[[ inputs.stage ]]
+  image:
+    name: projectdiscovery/nuclei:latest
+    entrypoint: [ "" ]
+  needs:
+  - $[[ inputs.dependencie_jobs ]]
+  variables:
+    TARGET_URL: $[[inputs.zap_target_url]]
+    DD_ACTIVATED: $[[inputs.send_to_defectdojo]]
+    DD_URL: $[[inputs.defectdojo_url]]
+    DD_TOKEN: $[[inputs.defectdojo_api_key]]
+    DD_PRODUCT: $[[inputs.defectdojo_product_name]]
+    DD_ENGAGEMENT_NAME: $[[inputs.defectdojo_engagement_name]]
+    DD_NUCLEI_PRODUCT_TYPE: $[[inputs.defectdojo_nuclei_product_type_name]]
+  before_script:
+  - apk add --no-cache curl jq
+  script:
+  - !reference [ .defectdojo_lib, script ]
+  - nuclei -update-templates
+  - |
+    nuclei -u "$TARGET_URL" \
+      -severity low,medium,high,critical \
+      -jsonl -o nuclei-report.jsonl \
+      -stats || true
+  - |
+    dd_reimport "nuclei-report.jsonl" "Nuclei Scan" "DAST" "$DD_NUCLEI_PRODUCT_TYPE"
+  artifacts:
+    when: always
+    access: maintainer
+    paths:
+    - nuclei-report.jsonl
+    expire_in: 1 day
+  allow_failure: true
+
+# ZAP DAST: scan (baseline/api/full) + envio ao DefectDojo no mesmo job
+zap:
+  image: ghcr.io/zaproxy/zaproxy:stable
+  environment: $[[ inputs.environment ]]
+  stage: $[[ inputs.stage ]]
+  resource_group: dast-zap
+  needs:
+  - $[[ inputs.dependencie_jobs ]]
+  - job: nuclei
+    optional: true
+  variables:
+    TARGET_URL: $[[inputs.zap_target_url]]
+    ZAP_REPORT_DIR: "zap-reports"
+    ZAP_MIN_LEVEL: $[[inputs.zap_min_level]]
+    ZAP_AUTH_TOKEN: $[[inputs.zap_auth_token]]
+    ZAP_RULES_FILE: $[[inputs.zap_rules_file]]
+    ZAP_API_ENABLED: $[[inputs.zap_api_enabled]]
+    ZAP_API_SPEC_URL: $[[inputs.zap_api_spec_url]]
+    ZAP_API_FORMAT: $[[inputs.zap_api_format]]
+    ZAP_FULL_SCAN: $[[inputs.zap_full_scan]]
+    ZAP_ALLOW_PROD: $[[inputs.zap_allow_prod]]
+    ZAP_AUDIT_ONLY: $[[inputs.zap_audit_only]]
+    ZAP_EXTRA_ARGS: $[[inputs.zap_extra_args]]
+    ZAP_CONTEXTS_DIR: $[[inputs.zap_contexts_dir]]
+    ZAP_SCRIPTS_DIR: $[[inputs.zap_scripts_dir]]
+    ZAP_SPIDER_MINS: $[[inputs.zap_spider_mins]]
+    DD_ACTIVATED: $[[inputs.send_to_defectdojo]]
+    DD_URL: $[[inputs.defectdojo_url]]
+    DD_TOKEN: $[[inputs.defectdojo_api_key]]
+    DD_PRODUCT: $[[inputs.defectdojo_product_name]]
+    DD_ENGAGEMENT_NAME: $[[inputs.defectdojo_engagement_name]]
+    DD_ZAP_PRODUCT_TYPE: $[[inputs.defectdojo_zap_product_type_name]]
+  before_script:
+  - mkdir -p /zap/wrk/"$ZAP_REPORT_DIR"
+  - mkdir -p "$ZAP_REPORT_DIR"
+  - |
+    # Ensure jq is available for the DefectDojo upload helper
+    if ! command -v jq >/dev/null 2>&1; then
+      (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y jq) \
+        || (apt-get update && apt-get install -y jq) \
+        || echo "WARN: jq indisponivel; upload DefectDojo pode falhar"
+    fi
+  - |
+    # Build auth argument if token provided.
+    ZAP_AUTH_ARGS=""
+    if [ -n "$ZAP_AUTH_TOKEN" ]; then
+      ZAP_AUTH_ARGS="\
+        -config replacer.full_list(0).description=BearerAuth \
+        -config replacer.full_list(0).enabled=true \
+        -config replacer.full_list(0).matchtype=REQ_HEADER \
+        -config replacer.full_list(0).matchstr=Authorization \
+        -config replacer.full_list(0).replacement=Bearer\ ${ZAP_AUTH_TOKEN}"
+    fi
+    export ZAP_AUTH_ARGS
+
+    # Copy local contexts and scripts into ZAP working dir so -context and scripts work
+    if [ -n "$ZAP_CONTEXTS_DIR" ] && [ -d "$ZAP_CONTEXTS_DIR" ]; then
+      cp -r "$ZAP_CONTEXTS_DIR" /zap/wrk/ || true
+    fi
+    if [ -n "$ZAP_SCRIPTS_DIR" ] && [ -d "$ZAP_SCRIPTS_DIR" ]; then
+      cp -r "$ZAP_SCRIPTS_DIR" /zap/wrk/ || true
+    fi
+  script:
+  - !reference [ .defectdojo_lib, script ]
+  - |
+    [ -z "$TARGET_URL" ] && echo "Erro: TARGET_URL nao definida" && exit 1
+
+    RULES_ARG=""
+    [ -n "$ZAP_RULES_FILE" ] && RULES_ARG="-c $ZAP_RULES_FILE"
+
+    AUDIT_ARG=""
+    if [ "${ZAP_AUDIT_ONLY:-true}" = "true" ]; then
+      AUDIT_ARG="-I"
+    fi
+
+    if [ "$ZAP_FULL_SCAN" = "true" ]; then
+      # Guardrail: block full-scan against production-like URLs unless explicitly allowed
+      if echo "$TARGET_URL" | grep -qiE '(prod|production)' && [ "${ZAP_ALLOW_PROD:-false}" != "true" ]; then
+        echo "BLOCKED: full-scan is not allowed against production-like URLs without ZAP_ALLOW_PROD=true."
+        echo "Received URL: $TARGET_URL"
+        exit 1
+      fi
+
+      zap-full-scan.py \
+        -t "$TARGET_URL" \
+        -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-full-report.html" \
+        -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-full-report.json" \
+        -x "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-full-report.xml" \
+        -l "$ZAP_MIN_LEVEL" \
+        -m "$ZAP_SPIDER_MINS" \
+        $AUDIT_ARG \
+        $RULES_ARG \
+        -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS" || true
+    else
+      zap-baseline.py \
+        -t "$TARGET_URL" \
+        -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-baseline-report.html" \
+        -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-baseline-report.json" \
+        -x "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-baseline-report.xml" \
+        -l "$ZAP_MIN_LEVEL" \
+        $AUDIT_ARG \
+        $RULES_ARG \
+        -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS" || true
+
+      if [ "$ZAP_API_ENABLED" = "true" ]; then
+        [ -z "$ZAP_API_SPEC_URL" ] && echo "Erro: ZAP_API_SPEC_URL nao definida" && exit 1
+        zap-api-scan.py \
+          -t "$TARGET_URL" \
+          -f "$ZAP_API_FORMAT" \
+          -S "$ZAP_API_SPEC_URL" \
+          -r "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-api-report.html" \
+          -J "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-api-report.json" \
+          -x "$ZAP_REPORT_DIR/${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}-api-report.xml" \
+          -l "$ZAP_MIN_LEVEL" \
+          $AUDIT_ARG \
+          $RULES_ARG \
+          -z "$ZAP_AUTH_ARGS $ZAP_EXTRA_ARGS" || true
+      fi
+    fi
+
+    echo "Relatorio salvo em: $ZAP_REPORT_DIR/"
+  - |
+    # Bring reports from ZAP working dir to project dir, then upload to DefectDojo
+    if [ -d /zap/wrk/"$ZAP_REPORT_DIR" ]; then
+      mkdir -p "$ZAP_REPORT_DIR"
+      cp -r /zap/wrk/"$ZAP_REPORT_DIR"/. "$ZAP_REPORT_DIR"/ || true
+    fi
+    for f in "$ZAP_REPORT_DIR"/*-report.xml; do
+      [ -f "$f" ] || continue
+      dd_reimport "$f" "ZAP Scan" "DAST" "$DD_ZAP_PRODUCT_TYPE"
+    done
+  after_script:
+  - |
+    if [ -d /zap/wrk/"$ZAP_REPORT_DIR" ]; then
+      mkdir -p "$ZAP_REPORT_DIR"
+      cp -r /zap/wrk/"$ZAP_REPORT_DIR"/. "$ZAP_REPORT_DIR"/ || true
+    fi
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+    - "$ZAP_REPORT_DIR/"
+  allow_failure: true
